@@ -145,28 +145,111 @@ def _json(text: str):
     return {}
 
 
+def _json_stakeholder(text: str) -> dict:
+    """
+    Robust parser specifically for stakeholder JSON.
+    Handles: text before JSON, wrapped under 'stakeholders' key,
+    trailing commas, and validates structure.
+    """
+    # Strip markdown fences
+    clean = re.sub(r"```json|```", "", text).strip()
+
+    # Remove any text before the first {
+    brace_idx = clean.find("{")
+    if brace_idx > 0:
+        clean = clean[brace_idx:]
+
+    parsed = None
+
+    # Try direct parse
+    try:
+        parsed = json.loads(clean)
+    except Exception:
+        pass
+
+    # Fix trailing commas and retry
+    if parsed is None:
+        try:
+            fixed = re.sub(r",\s*}", "}", re.sub(r",\s*]", "]", clean))
+            parsed = json.loads(fixed)
+        except Exception:
+            pass
+
+    # Regex fallback — extract largest JSON object
+    if parsed is None:
+        m = re.search(r"\{.*\}", clean, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except Exception:
+                try:
+                    fixed = re.sub(r",\s*}", "}", re.sub(r",\s*]", "]", m.group(0)))
+                    parsed = json.loads(fixed)
+                except Exception:
+                    pass
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    # Unwrap if nested under "stakeholders" key
+    if "stakeholders" in parsed and isinstance(parsed.get("stakeholders"), dict):
+        parsed = parsed["stakeholders"]
+
+    # Keep only valid stakeholder entries (must have impact_level)
+    valid_groups = [
+        "students", "faculty", "colleges", "universities",
+        "administrators", "accreditation_teams",
+        "scholarship_applicants", "researchers"
+    ]
+    result = {}
+    for k, v in parsed.items():
+        if isinstance(v, dict) and "impact_level" in v:
+            # Normalise key
+            key = k.lower().replace(" ", "_")
+            result[key] = v
+
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENHANCEMENT 1 — READABILITY SCORE (no LLM needed, pure Python)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def calculate_readability(text: str) -> dict:
     """
-    Calculate readability metrics of the regulation document.
-    Uses Flesch-Kincaid grade level and reading ease score.
-    Higher grade = harder to read. Higher ease = easier to read.
+    Calculate readability metrics using manual formulas.
+    Does NOT depend on textstat or NLTK cmudict — works everywhere.
+    Uses Flesch Reading Ease formula directly with syllable estimation.
     """
     try:
-        import textstat
-        sample = text[:5000]   # Use first 5000 chars for speed
+        words     = text.split()
+        word_count = len(words)
+        sentences  = re.findall(r'[.!?]+', text)
+        sent_count = max(len(sentences), 1)
+        avg_wps    = round(word_count / sent_count, 1)
 
-        fk_grade    = textstat.flesch_kincaid_grade(sample)
-        fk_ease     = textstat.flesch_reading_ease(sample)
-        fog_index   = textstat.gunning_fog(sample)
-        word_count  = len(text.split())
-        sent_count  = len(re.findall(r'[.!?]+', text))
-        avg_words   = round(word_count / max(sent_count, 1), 1)
+        # Estimate syllables without NLTK (count vowel groups per word)
+        def count_syllables(word):
+            word = word.lower().strip(".,!?;:\"'")
+            if not word:
+                return 1
+            count = len(re.findall(r'[aeiou]+', word))
+            if word.endswith('e') and count > 1:
+                count -= 1
+            return max(1, count)
 
-        # Grade level label
+        total_syllables = sum(count_syllables(w) for w in words)
+        avg_syl_per_word = total_syllables / max(word_count, 1)
+
+        # Flesch Reading Ease formula
+        fk_ease = 206.835 - (1.015 * avg_wps) - (84.6 * avg_syl_per_word)
+        fk_ease = round(max(0, min(100, fk_ease)), 1)
+
+        # Flesch-Kincaid Grade Level formula
+        fk_grade = (0.39 * avg_wps) + (11.8 * avg_syl_per_word) - 15.59
+        fk_grade = round(max(0, fk_grade), 1)
+
+        # Labels
         if fk_grade <= 6:
             grade_label = "Very Easy (Primary School)"
         elif fk_grade <= 9:
@@ -178,7 +261,6 @@ def calculate_readability(text: str) -> dict:
         else:
             grade_label = "Very Difficult (Expert / Legal)"
 
-        # Ease label
         if fk_ease >= 70:
             ease_label = "Easy to Read"
         elif fk_ease >= 50:
@@ -189,21 +271,22 @@ def calculate_readability(text: str) -> dict:
             ease_label = "Very Difficult (Legal/Technical)"
 
         return {
-            "flesch_kincaid_grade":  round(fk_grade, 1),
-            "flesch_reading_ease":   round(fk_ease, 1),
-            "gunning_fog_index":     round(fog_index, 1),
-            "grade_label":           grade_label,
-            "ease_label":            ease_label,
-            "word_count":            word_count,
-            "sentence_count":        sent_count,
-            "avg_words_per_sentence": avg_words,
+            "flesch_kincaid_grade":   fk_grade,
+            "flesch_reading_ease":    fk_ease,
+            "grade_label":            grade_label,
+            "ease_label":             ease_label,
+            "word_count":             word_count,
+            "sentence_count":         sent_count,
+            "avg_words_per_sentence": avg_wps,
             "estimated_read_minutes": max(1, round(word_count / 200)),
         }
-    except ImportError:
+    except Exception as e:
+        word_count = len(text.split())
         return {
-            "error": "textstat not installed. Run: pip install textstat",
-            "word_count": len(text.split()),
-            "estimated_read_minutes": max(1, round(len(text.split()) / 200)),
+            "word_count":             word_count,
+            "estimated_read_minutes": max(1, round(word_count / 200)),
+            "grade_label":            "Could not calculate",
+            "ease_label":             "Could not calculate",
         }
 
 
@@ -306,16 +389,41 @@ Document:
 
 
 def analyze_stakeholder_impact(text: str) -> dict:
-    prompt = f"""Analyze this Indian education regulation.
-Return ONLY valid JSON. Include only affected groups from:
+    prompt = f"""You are an Indian education policy expert.
+Analyze this regulation and identify which stakeholder groups are affected.
+
+Return ONLY valid JSON in exactly this format (include only groups that are actually affected):
+{{
+  "students": {{
+    "impact_level": "High",
+    "benefits": ["benefit 1", "benefit 2"],
+    "constraints": ["constraint 1", "constraint 2"],
+    "action_required": "One sentence describing what students must do."
+  }},
+  "faculty": {{
+    "impact_level": "High",
+    "benefits": ["benefit 1", "benefit 2"],
+    "constraints": ["constraint 1", "constraint 2"],
+    "action_required": "One sentence describing what faculty must do."
+  }}
+}}
+
+Groups to consider (include only those actually affected):
 students, faculty, colleges, universities, administrators,
 accreditation_teams, scholarship_applicants, researchers
-Each group: {{"impact_level":"High|Medium|Low|Not Affected",
-"benefits":["2-3 items"],"constraints":["2-3 items"],"action_required":"1 sentence"}}
+
+Rules:
+- Return ONLY the JSON object. No explanation before or after.
+- impact_level must be exactly: High, Medium, Low, or Not Affected
+- benefits and constraints must each have 2-3 items
+- Include at least 3 stakeholder groups
+
 Document:
 {text[:9000]}"""
-    result = _json(_call_llm(prompt))
-    return result if isinstance(result, dict) else {}
+
+    raw    = _call_llm(prompt)
+    result = _json_stakeholder(raw)
+    return result if isinstance(result, dict) and len(result) > 0 else {}
 
 
 def forecast_impact(text: str) -> dict:
