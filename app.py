@@ -10,7 +10,15 @@ All 9 tabs validated and working.
 
 import streamlit as st
 import tempfile, os, sys, json
-sys.path.insert(0, os.path.dirname(__file__))
+
+# ── Path fix — works on local Windows/Mac AND Hugging Face Spaces ──
+_dir = os.path.dirname(os.path.abspath(__file__))
+if _dir not in sys.path:
+    sys.path.insert(0, _dir)
+# Also add current working directory as fallback
+_cwd = os.getcwd()
+if _cwd not in sys.path:
+    sys.path.insert(0, _cwd)
 
 from ingestion.pdf_reader    import read_pdf
 from ingestion.url_scraper   import scrape_url
@@ -43,7 +51,7 @@ with st.sidebar:
     st.divider()
     input_method = st.radio(
         "**Input Method**",
-        ["📂 Upload PDF", "🌐 Paste URL"])
+        ["📂 Upload PDF", "🌐 Paste URL", "📋 Paste Text"])
     st.divider()
     st.markdown("**📚 Supported Sources**")
     for s in ["UGC Circulars","AICTE Notifications",
@@ -65,7 +73,7 @@ with st.sidebar:
         st.divider()
         if st.button("🔄 New Analysis", use_container_width=True, type="primary"):
             for k in ["results","doc_meta","analysis_text",
-                      "chat_history","checklist_state"]:
+                      "chat_history","checklist_state","suggested_questions"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -95,7 +103,7 @@ if "📂" in input_method:
             doc_meta = {"source": res["filename"], "pages": res["page_count"]}
         else:
             st.error(f"❌ {res['message']}")
-else:
+elif "🌐" in input_method:
     url = st.text_input(
         "Paste regulation URL",
         placeholder="https://www.ugc.gov.in/Circulars/...")
@@ -107,7 +115,50 @@ else:
             doc_text = res["text"]
             doc_meta = {"source": res["url"]}
         else:
-            st.error(f"❌ {res['message']}")
+            # Smart error message based on error type
+            err_msg = res.get("message", "")
+            if "403" in err_msg or "blocked" in err_msg.lower() or "allowlist" in err_msg.lower():
+                st.error("❌ This website blocks automated access (403 Forbidden).")
+                st.info("""
+**Government portals like ugcnet.nta.nic.in block web scrapers.**
+
+**3 easy workarounds:**
+
+**Option 1 — Download the PDF:**
+1. Open the URL in your browser
+2. Find the regulation/notification PDF link
+3. Download it → Upload using **📂 Upload PDF** tab
+
+**Option 2 — Save as PDF:**
+1. Open the URL in Chrome/Edge
+2. Press `Ctrl + P` → Select **Save as PDF**
+3. Upload the saved PDF using **📂 Upload PDF** tab
+
+**Option 3 — Copy & Paste text:**
+1. Open the URL in your browser
+2. Select all text (`Ctrl + A`) → Copy (`Ctrl + C`)
+3. Switch to **📋 Paste Text** tab → Paste the text
+""")
+            elif "timeout" in err_msg.lower() or "connect" in err_msg.lower():
+                st.error("❌ Could not reach the website. Check your internet connection and try again.")
+            else:
+                st.error(f"❌ {err_msg}")
+
+else:
+    # PASTE TEXT option
+    st.info("💡 Copy text from any government website or regulation document and paste it below.")
+    pasted = st.text_area(
+        "Paste regulation text here:",
+        placeholder="Paste the full text of the regulation, circular, or notification here...",
+        height=250,
+        help="Copy text from ugcnet.nta.nic.in or any other site that blocks automated access"
+    )
+    if pasted.strip() and len(pasted.strip()) > 100:
+        doc_text = pasted.strip()
+        doc_meta = {"source": "Pasted text", "chars": len(pasted)}
+        st.success(f"✅ Text received — {len(pasted):,} characters ready for analysis")
+    elif pasted.strip():
+        st.warning("⚠️ Text is too short. Please paste the full regulation text (minimum 100 characters).")
 
 # ── Analyze button ────────────────────────────────────────────────────────────
 if doc_text:
@@ -230,7 +281,9 @@ m2.metric("🏛️ Issuing Body", topic.get("issuing_body","—"))
 m3.metric("📅 Year",          topic.get("year","—"))
 m4.metric("🌐 Scope",         topic.get("scope","—"))
 bar_e = "🟢" if score>=7 else "🟡" if score>=4 else "🔴"
-m5.metric("💬 Sentiment",    f"{bar_e} {sent} ({score}/10)")
+# Split sentiment into label + delta to avoid overflow
+sent_short = sent.split()[0] if sent and sent != "—" else sent  # "Broadly" or "Mixed" etc
+m5.metric("💬 Sentiment", f"{bar_e} {sent_short}", f"{score}/10")
 
 themes = topic.get("key_themes",[])
 if themes:
@@ -676,17 +729,64 @@ with tabs[7]:
         st.session_state["chat_history"] = []
 
     st.markdown("**💡 Click a question to ask it instantly:**")
+
+    # Generate document-specific questions if not already cached
+    if "suggested_questions" not in st.session_state:
+        with st.spinner("Generating questions from your document..."):
+            try:
+                q_prompt = f"""You are an expert on Indian education regulations.
+Based on this regulation document, generate exactly 6 specific questions that a student, faculty member, or college administrator would want answered.
+
+Rules:
+- Questions must be directly answerable from THIS document
+- Make them specific to the content (use actual terms, names, dates from the document)
+- Cover different aspects: eligibility, deadlines, penalties, procedures, stakeholders
+- Do NOT ask generic questions like "What is this document about?"
+- Return ONLY a JSON array of 6 question strings, nothing else
+
+Document:
+{atext[:6000]}
+
+Return format: ["Question 1?", "Question 2?", "Question 3?", "Question 4?", "Question 5?", "Question 6?"]"""
+
+                import json as _json_mod
+                from analysis.analyzer import _call_llm
+                raw = _call_llm(q_prompt)
+                # Parse JSON array
+                import re as _re
+                clean = _re.sub(r"```json|```", "", raw).strip()
+                # Find array
+                m = _re.search(r"\[.*?\]", clean, _re.DOTALL)
+                if m:
+                    qs = _json_mod.loads(m.group(0))
+                    # Validate — must be list of strings
+                    if isinstance(qs, list) and len(qs) >= 4:
+                        st.session_state["suggested_questions"] = qs[:6]
+                    else:
+                        raise ValueError("Invalid format")
+                else:
+                    raise ValueError("No array found")
+            except Exception:
+                # Fallback to document-aware generic questions
+                cat   = topic.get("category", "regulation")
+                body  = topic.get("issuing_body", "the regulatory body")
+                year  = topic.get("year", "")
+                themes = topic.get("key_themes", [])
+                t1 = themes[0] if len(themes) > 0 else "eligibility"
+                t2 = themes[1] if len(themes) > 1 else "compliance"
+                st.session_state["suggested_questions"] = [
+                    f"Who is most affected by this {cat} regulation?",
+                    f"What are the key deadlines mentioned in this {body} document?",
+                    f"What penalties exist for non-compliance?",
+                    f"What are the requirements related to {t1}?",
+                    f"What must institutions do to comply with {t2}?",
+                    f"What changed in this {year} regulation compared to before?",
+                ]
+
+    suggested = st.session_state["suggested_questions"]
     sq_cols = st.columns(2)
-    suggested = [
-        "Who is most affected by this regulation?",
-        "What are the key deadlines mentioned?",
-        "What penalties exist for non-compliance?",
-        "What are the minimum qualifications required?",
-        "How does this affect scholarship students?",
-        "What must institutions do to comply?",
-    ]
-    for i,sq in enumerate(suggested):
-        with sq_cols[i%2]:
+    for i, sq in enumerate(suggested):
+        with sq_cols[i % 2]:
             if st.button(sq, key=f"sq{i}", use_container_width=True):
                 st.session_state["pending_q"] = sq
                 st.rerun()
